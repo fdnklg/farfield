@@ -200,6 +200,8 @@ const ThreadListItemWithAgentSchema = AppServerListThreadsResponseSchema.shape.d
   z
     .object({
       agentId: z.enum(["codex", "opencode"]),
+      title: z.string().nullable().optional(),
+      threadName: z.string().nullable().optional(),
       source: z.string().optional()
     })
     .passthrough()
