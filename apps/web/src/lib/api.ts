@@ -13,6 +13,16 @@ import { z } from "zod";
 
 const RequestIdSchema = z.union([z.string().min(1), z.number().int().nonnegative()]);
 
+export class ApiRequestError extends Error {
+  readonly statusCode: number;
+
+  constructor(statusCode: number, message: string) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.statusCode = statusCode;
+  }
+}
+
 const ApiEnvelopeSchema = z
   .object({
     ok: z.boolean(),
@@ -139,12 +149,36 @@ const HistoryDetailSchema = z
   .passthrough();
 
 async function request(path: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(path, init);
+  const timeoutMs = init?.method === "POST" && path.includes("/messages") ? 30_000 : null;
+  const controller = new AbortController();
+  const timeoutId = timeoutMs !== null
+    ? globalThis.setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError" && timeoutMs !== null) {
+      throw new ApiRequestError(408, `Send request timed out after ${String(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) {
+      globalThis.clearTimeout(timeoutId);
+    }
+  }
+
   const data = (await response.json()) as unknown;
   const envelope = ApiEnvelopeSchema.parse(data);
 
   if (!response.ok || !envelope.ok) {
-    throw new Error(typeof envelope.error === "string" ? envelope.error : "Request failed");
+    throw new ApiRequestError(
+      response.status,
+      typeof envelope.error === "string" ? envelope.error : "Request failed"
+    );
   }
 
   return data;
