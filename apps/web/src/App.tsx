@@ -152,10 +152,37 @@ function formatDate(value: number | string | null | undefined): string {
   return "";
 }
 
-function threadLabel(thread: Thread): string {
-  const text = thread.preview.trim();
-  if (!text) return `thread ${thread.id.slice(0, 8)}`;
-  return text;
+function normalizeThreadTitle(value: string | null | undefined): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function threadTitleFromListItem(thread: Thread): string | null {
+  return normalizeThreadTitle(thread.title ?? thread.threadName ?? null);
+}
+
+function threadLabelWithSyncedTitle(
+  thread: Thread,
+  syncedThreadTitleById: Record<string, string>
+): string {
+  const syncedTitle = normalizeThreadTitle(syncedThreadTitleById[thread.id]);
+  if (syncedTitle) {
+    return syncedTitle;
+  }
+
+  const listedTitle = threadTitleFromListItem(thread);
+  if (listedTitle) {
+    return listedTitle;
+  }
+
+  const preview = thread.preview.trim();
+  if (preview.length > 0) {
+    return preview;
+  }
+  return `thread ${thread.id.slice(0, 8)}`;
 }
 
 function toErrorMessage(err: unknown): string {
@@ -358,6 +385,7 @@ function buildLiveStateSyncSignature(state: LiveStateResponse | null | undefined
     state.ownerClientId ?? "",
     String(getConversationStateUpdatedAt(conversationState)),
     String(conversationState?.turns.length ?? -1),
+    normalizeThreadTitle(conversationState?.title) ?? "",
     modeSelectionSignatureFromConversationState(conversationState),
     conversationProgressSignature(conversationState)
   ].join("|");
@@ -373,6 +401,7 @@ function buildReadThreadSyncSignature(state: ReadThreadResponse | null | undefin
     conversationState.id,
     String(getConversationStateUpdatedAt(conversationState)),
     String(conversationState.turns.length),
+    normalizeThreadTitle(conversationState.title) ?? "",
     modeSelectionSignatureFromConversationState(conversationState),
     conversationProgressSignature(conversationState)
   ].join("|");
@@ -514,6 +543,7 @@ export function App(): React.JSX.Element {
   const [liveState, setLiveState] = useState<LiveStateResponse | null>(null);
   const [readThreadState, setReadThreadState] = useState<ReadThreadResponse | null>(null);
   const [streamEvents, setStreamEvents] = useState<StreamEventsResponse["events"]>([]);
+  const [syncedThreadTitleById, setSyncedThreadTitleById] = useState<Record<string, string>>({});
   const [modes, setModes] = useState<ModesResponse["data"]>([]);
   const [models, setModels] = useState<ModelsResponse["data"]>([]);
   const [selectedModeKey, setSelectedModeKey] = useState("");
@@ -815,6 +845,8 @@ export function App(): React.JSX.Element {
         thread.id,
         String(thread.updatedAt ?? 0),
         thread.preview,
+        thread.title ?? "",
+        thread.threadName ?? "",
         thread.agentId,
         thread.cwd ?? "",
         thread.path ?? ""
@@ -847,6 +879,25 @@ export function App(): React.JSX.Element {
         threadsSignatureRef.current = nextThreadsSignature;
         setThreads(nt.data);
       }
+      setSyncedThreadTitleById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const thread of nt.data) {
+          const listedTitle = threadTitleFromListItem(thread);
+          if (listedTitle) {
+            if (next[thread.id] !== listedTitle) {
+              next[thread.id] = listedTitle;
+              changed = true;
+            }
+            continue;
+          }
+          if ((thread.title !== undefined || thread.threadName !== undefined) && next[thread.id]) {
+            delete next[thread.id];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
       if (!signaturesMatch(modesSignatureRef.current, nextModesSignature)) {
         modesSignatureRef.current = nextModesSignature;
         setModes(nm.data);
@@ -959,6 +1010,19 @@ export function App(): React.JSX.Element {
     if ((live.conversationState?.turns.length ?? 0) > 0 || read.thread.turns.length > 0) {
       pendingMaterializationThreadIdsRef.current.delete(threadId);
     }
+    const syncedConversationTitle = (() => {
+      const liveConversationState = live.conversationState;
+      const readConversationState = read.thread;
+      if (!liveConversationState) {
+        return normalizeThreadTitle(readConversationState.title);
+      }
+      const liveUpdatedAt = getConversationStateUpdatedAt(liveConversationState);
+      const readUpdatedAt = getConversationStateUpdatedAt(readConversationState);
+      if (liveUpdatedAt > readUpdatedAt) {
+        return normalizeThreadTitle(liveConversationState.title);
+      }
+      return normalizeThreadTitle(readConversationState.title);
+    })();
     startTransition(() => {
       setLiveState((prev) => {
         if (buildLiveStateSyncSignature(prev) === buildLiveStateSyncSignature(live)) {
@@ -981,6 +1045,24 @@ export function App(): React.JSX.Element {
           return prev;
         }
         return stream.events;
+      });
+      setSyncedThreadTitleById((prev) => {
+        const previousTitle = prev[threadId];
+        if (syncedConversationTitle) {
+          if (previousTitle === syncedConversationTitle) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [threadId]: syncedConversationTitle
+          };
+        }
+        if (!previousTitle) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[threadId];
+        return next;
       });
     });
   }, [agentsById, selectedAgentId, threads]);
@@ -1746,7 +1828,9 @@ export function App(): React.JSX.Element {
                                   />
                                 </span>
                               )}
-                                <span className="truncate">{threadLabel(thread)}</span>
+                                <span className="truncate">
+                                  {threadLabelWithSyncedTitle(thread, syncedThreadTitleById)}
+                                </span>
                               </span>
                             <span className="shrink-0 flex items-center gap-1.5">
                               {threadIsGenerating && (
@@ -1913,7 +1997,9 @@ export function App(): React.JSX.Element {
             )}
             <div className="min-w-0">
               <div className="text-sm font-medium truncate leading-5 flex items-center gap-1.5">
-                {selectedThread ? threadLabel(selectedThread) : "No thread selected"}
+                {selectedThread
+                  ? threadLabelWithSyncedTitle(selectedThread, syncedThreadTitleById)
+                  : "No thread selected"}
                 {selectedThread && activeAgentLabel && (
                   <span className="shrink-0 h-5 w-5 rounded-md bg-muted/30 ring-1 ring-border/60 flex items-center justify-center overflow-hidden">
                     <AgentFavicon
