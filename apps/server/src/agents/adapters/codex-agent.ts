@@ -438,7 +438,7 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   public async submitUserInput(
     input: AgentSubmitUserInputInput
-  ): Promise<{ ownerClientId: string; requestId: number }> {
+  ): Promise<{ ownerClientId: string; requestId: AgentSubmitUserInputInput["requestId"] }> {
     this.ensureCodexAvailable();
     this.ensureIpcReady();
 

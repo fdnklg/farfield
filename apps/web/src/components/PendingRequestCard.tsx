@@ -42,7 +42,7 @@ export function PendingRequestCard({
                 onValueChange={(value) => onDraftChange(q.id, "option", value)}
                 className="space-y-1"
               >
-                {q.options.map((opt, optionIndex) => {
+                {(q.options ?? []).map((opt, optionIndex) => {
                   const optionId = `q-${q.id}-opt-${optionIndex}`;
                   return (
                     <Label

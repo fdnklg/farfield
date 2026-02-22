@@ -84,7 +84,7 @@ export interface AgentSetCollaborationModeInput {
 export interface AgentSubmitUserInputInput {
   threadId: string;
   ownerClientId?: string;
-  requestId: number;
+  requestId: string | number;
   response: UserInputResponsePayload;
 }
 
@@ -139,7 +139,7 @@ export interface AgentAdapter {
   setCollaborationMode?(input: AgentSetCollaborationModeInput): Promise<{ ownerClientId: string }>;
   submitUserInput?(
     input: AgentSubmitUserInputInput
-  ): Promise<{ ownerClientId: string; requestId: number }>;
+  ): Promise<{ ownerClientId: string; requestId: string | number }>;
   readLiveState?(threadId: string): Promise<AgentThreadLiveState>;
   readStreamEvents?(threadId: string, limit: number): Promise<AgentThreadStreamEvents>;
   listProjectDirectories?(): Promise<string[]>;
