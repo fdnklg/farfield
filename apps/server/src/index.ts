@@ -27,12 +27,14 @@ import { ThreadIndex } from "./agents/thread-index.js";
 import { CodexAgentAdapter } from "./agents/adapters/codex-agent.js";
 import { OpenCodeAgentAdapter } from "./agents/adapters/opencode-agent.js";
 import type { AgentAdapter, AgentDescriptor, AgentId } from "./agents/types.js";
+import { createSecurityPolicy } from "./auth.js";
 
 const HOST = process.env["HOST"] ?? "127.0.0.1";
 const PORT = Number(process.env["PORT"] ?? 4311);
 const HISTORY_LIMIT = 2_000;
 const USER_AGENT = "farfield/0.2.0";
 const IPC_RECONNECT_DELAY_MS = 1_000;
+const SEND_MESSAGE_TIMEOUT_MS = parseInteger(process.env["SEND_MESSAGE_TIMEOUT_MS"] ?? null, 30_000);
 
 const TRACE_DIR = path.resolve(process.cwd(), "traces");
 const DEFAULT_WORKSPACE = path.resolve(process.cwd());
@@ -66,6 +68,16 @@ interface ParsedReplayFrame {
   params: IpcRequestFrame["params"];
   targetClientId?: string;
   version?: number;
+}
+
+class RequestTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(message: string, timeoutMs: number) {
+    super(message);
+    this.name = "RequestTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
 }
 
 function resolveCodexExecutablePath(): string {
@@ -140,11 +152,28 @@ function jsonResponse(res: ServerResponse, statusCode: number, body: unknown): v
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": encoded.length,
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Origin": security.corsOrigin,
+    "Access-Control-Allow-Headers": "content-type,cf-access-jwt-assertion",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
   });
   res.end(encoded);
+}
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, actionLabel: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<T>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new RequestTimeoutError(`${actionLabel} timed out after ${String(timeoutMs)}ms`, timeoutMs));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([operation, timeoutPromise]);
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
 }
 
 function eventResponse(res: ServerResponse, body: unknown): void {
@@ -241,6 +270,7 @@ const historyById = new Map<string, unknown>();
 const sseClients = new Set<ServerResponse>();
 const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
 const threadIndex = new ThreadIndex();
+const security = createSecurityPolicy();
 
 let activeTrace: ActiveTrace | null = null;
 const recentTraces: TraceSummary[] = [];
@@ -287,7 +317,17 @@ function pushHistory(
 
 function summarizeActionDetails(details: Record<string, unknown>): Record<string, unknown> {
   const summary: Record<string, unknown> = {};
-  const keys = ["agentId", "threadId", "ownerClientId", "requestId", "textLength", "cwd", "model"];
+  const keys = [
+    "agentId",
+    "threadId",
+    "ownerClientId",
+    "requestId",
+    "textLength",
+    "cwd",
+    "model",
+    "timeoutMs",
+    "durationMs"
+  ];
 
   for (const key of keys) {
     const value = details[key];
@@ -509,6 +549,18 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${HOST}:${PORT}`);
     const pathname = url.pathname;
     const segments = pathname.split("/").filter(Boolean);
+    const requiresApiAuth = pathname === "/events" || pathname.startsWith("/api/");
+
+    if (requiresApiAuth) {
+      const authResult = await security.authenticate(req);
+      if (!authResult.ok) {
+        jsonResponse(res, authResult.status, {
+          ok: false,
+          error: authResult.error
+        });
+        return;
+      }
+    }
 
     if (req.method === "GET" && pathname === "/events") {
       res.writeHead(200, {
@@ -516,7 +568,7 @@ const server = http.createServer(async (req, res) => {
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
-        "Access-Control-Allow-Origin": "*"
+        "Access-Control-Allow-Origin": security.corsOrigin
       });
       res.write("retry: 1000\n\n");
 
@@ -803,33 +855,50 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === "POST" && segments[3] === "messages") {
         const body = parseBody(SendMessageBodySchema, await readJsonBody(req));
+        const requestId = randomUUID();
+        const startedAt = Date.now();
 
         pushActionEvent("messages", "attempt", {
+          requestId,
           agentId: resolved.agentId,
           threadId,
-          textLength: body.text.length
+          textLength: body.text.length,
+          timeoutMs: SEND_MESSAGE_TIMEOUT_MS
         });
 
         try {
-          await adapter.sendMessage({
-            threadId,
-            text: body.text,
-            ...(body.ownerClientId ? { ownerClientId: body.ownerClientId } : {}),
-            ...(body.cwd ? { cwd: body.cwd } : {}),
-            ...(typeof body.isSteering === "boolean" ? { isSteering: body.isSteering } : {})
-          });
+          await withTimeout(
+            adapter.sendMessage({
+              threadId,
+              text: body.text,
+              ...(body.ownerClientId ? { ownerClientId: body.ownerClientId } : {}),
+              ...(body.cwd ? { cwd: body.cwd } : {}),
+              ...(typeof body.isSteering === "boolean" ? { isSteering: body.isSteering } : {})
+            }),
+            SEND_MESSAGE_TIMEOUT_MS,
+            "Send message"
+          );
         } catch (error) {
+          const durationMs = Date.now() - startedAt;
           const message = pushActionError("messages", error, {
+            requestId,
             agentId: resolved.agentId,
-            threadId
+            threadId,
+            timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+            durationMs
           });
-          jsonResponse(res, 500, { ok: false, error: message, threadId });
+          const statusCode = error instanceof RequestTimeoutError ? 504 : 500;
+          jsonResponse(res, statusCode, { ok: false, error: message, threadId });
           return;
         }
 
+        const durationMs = Date.now() - startedAt;
         pushActionEvent("messages", "success", {
+          requestId,
           agentId: resolved.agentId,
-          threadId
+          threadId,
+          timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+          durationMs
         });
 
         jsonResponse(res, 200, {
@@ -980,6 +1049,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (segments[0] === "api" && segments[1] === "debug") {
+      if (!security.debugApiEnabled) {
+        jsonResponse(res, 404, { ok: false, error: "Not found" });
+        return;
+      }
+
       if (req.method === "GET" && segments[2] === "history") {
         const limit = parseInteger(url.searchParams.get("limit"), 120);
         const data = history.slice(-limit);
@@ -1191,7 +1265,7 @@ const server = http.createServer(async (req, res) => {
           "Content-Type": "application/x-ndjson",
           "Content-Length": data.length,
           "Content-Disposition": `attachment; filename="${trace.id}.ndjson"`,
-          "Access-Control-Allow-Origin": "*"
+          "Access-Control-Allow-Origin": security.corsOrigin
         });
         res.end(data);
         return;
@@ -1228,7 +1302,10 @@ async function start(): Promise<void> {
   pushSystem("Starting Farfield monitor server", {
     appExecutable: codexExecutable,
     socketPath: ipcSocketPath,
-    agentIds: configuredAgentIds
+    agentIds: configuredAgentIds,
+    authMode: security.authMode,
+    debugApiEnabled: security.debugApiEnabled,
+    cloudflareTeamDomain: security.cloudflareTeamDomain
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -1247,7 +1324,10 @@ async function start(): Promise<void> {
     url: `http://${HOST}:${PORT}`,
     appExecutable: codexExecutable,
     socketPath: ipcSocketPath,
-    agentIds: configuredAgentIds
+    agentIds: configuredAgentIds,
+    authMode: security.authMode,
+    debugApiEnabled: security.debugApiEnabled,
+    cloudflareTeamDomain: security.cloudflareTeamDomain
   });
 
   for (const adapter of registry.listAdapters()) {
