@@ -11,6 +11,8 @@ import {
 } from "@farfield/protocol";
 import { z } from "zod";
 
+const RequestIdSchema = z.union([z.string().min(1), z.number().int().nonnegative()]);
+
 const ApiEnvelopeSchema = z
   .object({
     ok: z.boolean(),
@@ -324,9 +326,10 @@ export async function setCollaborationMode(input: {
 export async function submitUserInput(input: {
   threadId: string;
   ownerClientId?: string;
-  requestId: number;
+  requestId: z.infer<typeof RequestIdSchema>;
   response: z.infer<typeof UserInputResponsePayloadSchema>;
 }): Promise<void> {
+  RequestIdSchema.parse(input.requestId);
   UserInputResponsePayloadSchema.parse(input.response);
 
   const { threadId, ...body } = input;

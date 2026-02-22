@@ -27,7 +27,7 @@ export interface SetModeInput {
 export interface SubmitUserInputInput {
   threadId: string;
   ownerClientId: string;
-  requestId: number;
+  requestId: string | number;
   response: UserInputResponsePayload;
 }
 

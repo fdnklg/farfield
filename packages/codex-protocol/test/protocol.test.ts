@@ -224,6 +224,59 @@ describe("codex-protocol schemas", () => {
     expect(parsed.turns[0]?.items[0]?.type).toBe("userInputResponse");
   });
 
+  it("parses requestUserInput request with string id", () => {
+    const parsed = parseThreadConversationState({
+      id: "thread-123",
+      turns: [],
+      requests: [
+        {
+          method: "item/tool/requestUserInput",
+          id: "call_123",
+          params: {
+            threadId: "thread-123",
+            turnId: "turn-123",
+            itemId: "item-123",
+            questions: [
+              {
+                id: "q1",
+                header: "Choose",
+                question: "Select one"
+              }
+            ]
+          }
+        }
+      ]
+    });
+
+    expect(parsed.requests[0]?.id).toBe("call_123");
+    expect(parsed.requests[0]?.params.questions[0]?.isOther).toBe(false);
+    expect(parsed.requests[0]?.params.questions[0]?.isSecret).toBe(false);
+  });
+
+  it("parses userInputResponse item with string requestId", () => {
+    const parsed = parseThreadConversationState({
+      id: "thread-123",
+      turns: [
+        {
+          status: "completed",
+          items: [
+            {
+              id: "item-1",
+              type: "userInputResponse",
+              requestId: "call_123",
+              turnId: "turn-1",
+              questions: [{ id: "q", header: "H", question: "Q" }],
+              answers: { q: ["A"] }
+            }
+          ]
+        }
+      ],
+      requests: []
+    });
+
+    expect(parsed.turns[0]?.items[0]?.type).toBe("userInputResponse");
+  });
+
   it("parses thread conversation state with mixed text and image user content", () => {
     const parsed = parseThreadConversationState({
       id: "thread-123",

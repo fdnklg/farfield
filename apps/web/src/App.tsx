@@ -557,7 +557,7 @@ export function App(): React.JSX.Element {
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [historyDetail, setHistoryDetail] = useState<HistoryDetail | null>(null);
   const [waitForReplayResponse, setWaitForReplayResponse] = useState(false);
-  const [selectedRequestId, setSelectedRequestId] = useState<number | null>(null);
+  const [selectedRequestId, setSelectedRequestId] = useState<PendingRequest["id"] | null>(null);
   const [answerDraft, setAnswerDraft] = useState<Record<string, { option: string; freeform: string }>>({});
   const [agentDescriptors, setAgentDescriptors] = useState<AgentDescriptor[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<AgentId>("codex");
