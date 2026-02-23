@@ -34,6 +34,7 @@ const PORT = Number(process.env["PORT"] ?? 4311);
 const HISTORY_LIMIT = 2_000;
 const USER_AGENT = "farfield/0.2.0";
 const IPC_RECONNECT_DELAY_MS = 1_000;
+const SEND_MESSAGE_TIMEOUT_MS = parseInteger(process.env["SEND_MESSAGE_TIMEOUT_MS"] ?? null, 30_000);
 
 const TRACE_DIR = path.resolve(process.cwd(), "traces");
 const DEFAULT_WORKSPACE = path.resolve(process.cwd());
@@ -67,6 +68,16 @@ interface ParsedReplayFrame {
   params: IpcRequestFrame["params"];
   targetClientId?: string;
   version?: number;
+}
+
+class RequestTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(message: string, timeoutMs: number) {
+    super(message);
+    this.name = "RequestTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
 }
 
 function resolveCodexExecutablePath(): string {
@@ -146,6 +157,23 @@ function jsonResponse(res: ServerResponse, statusCode: number, body: unknown): v
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
   });
   res.end(encoded);
+}
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, actionLabel: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<T>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new RequestTimeoutError(`${actionLabel} timed out after ${String(timeoutMs)}ms`, timeoutMs));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([operation, timeoutPromise]);
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
 }
 
 function eventResponse(res: ServerResponse, body: unknown): void {
@@ -289,7 +317,17 @@ function pushHistory(
 
 function summarizeActionDetails(details: Record<string, unknown>): Record<string, unknown> {
   const summary: Record<string, unknown> = {};
-  const keys = ["agentId", "threadId", "ownerClientId", "requestId", "textLength", "cwd", "model"];
+  const keys = [
+    "agentId",
+    "threadId",
+    "ownerClientId",
+    "requestId",
+    "textLength",
+    "cwd",
+    "model",
+    "timeoutMs",
+    "durationMs"
+  ];
 
   for (const key of keys) {
     const value = details[key];
@@ -817,33 +855,50 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === "POST" && segments[3] === "messages") {
         const body = parseBody(SendMessageBodySchema, await readJsonBody(req));
+        const requestId = randomUUID();
+        const startedAt = Date.now();
 
         pushActionEvent("messages", "attempt", {
+          requestId,
           agentId: resolved.agentId,
           threadId,
-          textLength: body.text.length
+          textLength: body.text.length,
+          timeoutMs: SEND_MESSAGE_TIMEOUT_MS
         });
 
         try {
-          await adapter.sendMessage({
-            threadId,
-            text: body.text,
-            ...(body.ownerClientId ? { ownerClientId: body.ownerClientId } : {}),
-            ...(body.cwd ? { cwd: body.cwd } : {}),
-            ...(typeof body.isSteering === "boolean" ? { isSteering: body.isSteering } : {})
-          });
+          await withTimeout(
+            adapter.sendMessage({
+              threadId,
+              text: body.text,
+              ...(body.ownerClientId ? { ownerClientId: body.ownerClientId } : {}),
+              ...(body.cwd ? { cwd: body.cwd } : {}),
+              ...(typeof body.isSteering === "boolean" ? { isSteering: body.isSteering } : {})
+            }),
+            SEND_MESSAGE_TIMEOUT_MS,
+            "Send message"
+          );
         } catch (error) {
+          const durationMs = Date.now() - startedAt;
           const message = pushActionError("messages", error, {
+            requestId,
             agentId: resolved.agentId,
-            threadId
+            threadId,
+            timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+            durationMs
           });
-          jsonResponse(res, 500, { ok: false, error: message, threadId });
+          const statusCode = error instanceof RequestTimeoutError ? 504 : 500;
+          jsonResponse(res, statusCode, { ok: false, error: message, threadId });
           return;
         }
 
+        const durationMs = Date.now() - startedAt;
         pushActionEvent("messages", "success", {
+          requestId,
           agentId: resolved.agentId,
-          threadId
+          threadId,
+          timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+          durationMs
         });
 
         jsonResponse(res, 200, {
