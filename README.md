@@ -80,6 +80,7 @@ Set required variables:
 ```bash
 export FARFIELD_DIR="$HOME/Code/farfield"
 export FARFIELD_NODE_BIN="$(command -v node)"
+export FARFIELD_BUN_BIN="$(command -v bun)"
 export FARFIELD_CLOUDFLARED_BIN="$(command -v cloudflared)"
 export FARFIELD_TUNNEL_NAME="farfield"
 export FARFIELD_CLOUDFLARED_CONFIG="$HOME/.cloudflared/config.yml"
@@ -88,6 +89,8 @@ export FARFIELD_HOSTNAME="farfield.example.com"
 # optional override if you keep env elsewhere:
 # export FARFIELD_ENV_FILE="$HOME/.config/farfield/farfield.env"
 ```
+
+`FARFIELD_BUN_BIN` is strongly recommended for launchd because LaunchAgents start with a minimal `PATH`.
 
 Create app environment file (used by `scripts/launchd/run-farfield-app.sh`):
 
@@ -102,6 +105,12 @@ Install services:
 ```bash
 cd "$FARFIELD_DIR"
 scripts/launchd/install-macos-services.sh
+```
+
+Start everything with one command (after install):
+
+```bash
+scripts/launchd/start-macos-services.sh
 ```
 
 This installs:
