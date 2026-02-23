@@ -83,6 +83,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   private readonly service: CodexMonitorService;
   private readonly onStateChange: (() => void) | null;
   private readonly reconnectDelayMs: number;
+  private readonly workspaceDirectory: string;
 
   private readonly threadOwnerById = new Map<string, string>();
   private readonly streamEventsByThreadId = new Map<string, IpcFrame[]>();
@@ -103,6 +104,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   public constructor(options: CodexAgentOptions) {
     this.onStateChange = options.onStateChange ?? null;
     this.reconnectDelayMs = options.reconnectDelayMs;
+    this.workspaceDirectory = normalizeProjectDirectory(options.workspaceDir);
 
     this.appClient = new AppServerClient({
       executablePath: options.appExecutable,
@@ -296,10 +298,11 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (!cwd || cwd.trim().length === 0) {
       throw new Error("Codex thread creation requires cwd");
     }
+    const normalizedCwd = normalizeProjectDirectory(cwd);
 
     const result = await this.runAppServerCall(() =>
       this.appClient.startThread({
-        cwd,
+        cwd: normalizedCwd,
         ...(input.model ? { model: input.model } : {}),
         ...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
         ...(input.personality ? { personality: input.personality } : {}),
@@ -319,6 +322,11 @@ export class CodexAgentAdapter implements AgentAdapter {
       sandbox: result.sandbox,
       reasoningEffort: result.reasoningEffort
     };
+  }
+
+  public async listProjectDirectories(): Promise<string[]> {
+    this.ensureCodexAvailable();
+    return [this.workspaceDirectory];
   }
 
   public async readThread(input: AgentReadThreadInput): Promise<AgentReadThreadResult> {
@@ -438,7 +446,7 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   public async submitUserInput(
     input: AgentSubmitUserInputInput
-  ): Promise<{ ownerClientId: string; requestId: number }> {
+  ): Promise<{ ownerClientId: string; requestId: AgentSubmitUserInputInput["requestId"] }> {
     this.ensureCodexAvailable();
     this.ensureIpcReady();
 
@@ -778,6 +786,25 @@ function isKnownBenignAppServerStderr(line: string): boolean {
     line.includes("codex_core::rollout::list") &&
     line.includes("state db missing rollout path for thread")
   );
+}
+
+function normalizeProjectDirectory(directory: string): string {
+  const trimmed = directory.trim();
+  if (trimmed.length === 0) {
+    throw new Error("Project directory is required");
+  }
+
+  const resolved = path.resolve(trimmed);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Project directory does not exist: ${resolved}`);
+  }
+
+  const stats = fs.statSync(resolved);
+  if (!stats.isDirectory()) {
+    throw new Error(`Project path is not a directory: ${resolved}`);
+  }
+
+  return fs.realpathSync(resolved);
 }
 
 function writeInvalidStreamEventDetail(detail: Record<string, unknown>): void {

@@ -11,6 +11,8 @@ import {
 } from "@farfield/protocol";
 import { z } from "zod";
 
+const RequestIdSchema = z.union([z.string().min(1), z.number().int().nonnegative()]);
+
 export class ApiRequestError extends Error {
   readonly statusCode: number;
 
@@ -147,7 +149,28 @@ const HistoryDetailSchema = z
   .passthrough();
 
 async function request(path: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(path, init);
+  const timeoutMs = init?.method === "POST" && path.includes("/messages") ? 30_000 : null;
+  const controller = new AbortController();
+  const timeoutId = timeoutMs !== null
+    ? globalThis.setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError" && timeoutMs !== null) {
+      throw new ApiRequestError(408, `Send request timed out after ${String(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) {
+      globalThis.clearTimeout(timeoutId);
+    }
+  }
+
   const data = (await response.json()) as unknown;
   const envelope = ApiEnvelopeSchema.parse(data);
 
@@ -213,6 +236,8 @@ const ThreadListItemWithAgentSchema = AppServerListThreadsResponseSchema.shape.d
   z
     .object({
       agentId: z.enum(["codex", "opencode"]),
+      title: z.string().nullable().optional(),
+      threadName: z.string().nullable().optional(),
       source: z.string().optional()
     })
     .passthrough()
@@ -335,9 +360,10 @@ export async function setCollaborationMode(input: {
 export async function submitUserInput(input: {
   threadId: string;
   ownerClientId?: string;
-  requestId: number;
+  requestId: z.infer<typeof RequestIdSchema>;
   response: z.infer<typeof UserInputResponsePayloadSchema>;
 }): Promise<void> {
+  RequestIdSchema.parse(input.requestId);
   UserInputResponsePayloadSchema.parse(input.response);
 
   const { threadId, ...body } = input;

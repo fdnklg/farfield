@@ -99,6 +99,10 @@ type AgentDescriptor = AgentsResponse["agents"][number];
 type ConversationTurn = NonNullable<ReadThreadResponse["thread"]>["turns"][number];
 type ConversationTurnItem = NonNullable<ConversationTurn["items"]>[number];
 type ConversationItemType = ConversationTurnItem["type"];
+type PendingThreadDraft = {
+  projectPath: string;
+  agentId: AgentId;
+};
 
 interface FlatConversationItem {
   key: string;
@@ -153,10 +157,37 @@ function formatDate(value: number | string | null | undefined): string {
   return "";
 }
 
-function threadLabel(thread: Thread): string {
-  const text = thread.preview.trim();
-  if (!text) return `thread ${thread.id.slice(0, 8)}`;
-  return text;
+function normalizeThreadTitle(value: string | null | undefined): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function threadTitleFromListItem(thread: Thread): string | null {
+  return normalizeThreadTitle(thread.title ?? thread.threadName ?? null);
+}
+
+function threadLabelWithSyncedTitle(
+  thread: Thread,
+  syncedThreadTitleById: Record<string, string>
+): string {
+  const syncedTitle = normalizeThreadTitle(syncedThreadTitleById[thread.id]);
+  if (syncedTitle) {
+    return syncedTitle;
+  }
+
+  const listedTitle = threadTitleFromListItem(thread);
+  if (listedTitle) {
+    return listedTitle;
+  }
+
+  const preview = thread.preview.trim();
+  if (preview.length > 0) {
+    return preview;
+  }
+  return `thread ${thread.id.slice(0, 8)}`;
 }
 
 function toErrorMessage(err: unknown): string {
@@ -359,6 +390,7 @@ function buildLiveStateSyncSignature(state: LiveStateResponse | null | undefined
     state.ownerClientId ?? "",
     String(getConversationStateUpdatedAt(conversationState)),
     String(conversationState?.turns.length ?? -1),
+    normalizeThreadTitle(conversationState?.title) ?? "",
     modeSelectionSignatureFromConversationState(conversationState),
     conversationProgressSignature(conversationState)
   ].join("|");
@@ -374,6 +406,7 @@ function buildReadThreadSyncSignature(state: ReadThreadResponse | null | undefin
     conversationState.id,
     String(getConversationStateUpdatedAt(conversationState)),
     String(conversationState.turns.length),
+    normalizeThreadTitle(conversationState.title) ?? "",
     modeSelectionSignatureFromConversationState(conversationState),
     conversationProgressSignature(conversationState)
   ].join("|");
@@ -515,12 +548,13 @@ export function App(): React.JSX.Element {
   const [liveState, setLiveState] = useState<LiveStateResponse | null>(null);
   const [readThreadState, setReadThreadState] = useState<ReadThreadResponse | null>(null);
   const [streamEvents, setStreamEvents] = useState<StreamEventsResponse["events"]>([]);
+  const [syncedThreadTitleById, setSyncedThreadTitleById] = useState<Record<string, string>>({});
   const [modes, setModes] = useState<ModesResponse["data"]>([]);
   const [models, setModels] = useState<ModelsResponse["data"]>([]);
   const [selectedModeKey, setSelectedModeKey] = useState("");
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedReasoningEffort, setSelectedReasoningEffort] = useState("");
-  const [isBusy, setIsBusy] = useState(false);
+  const [busyThreadIds, setBusyThreadIds] = useState<Set<string>>(() => new Set());
   const [traceStatus, setTraceStatus] = useState<TraceStatus | null>(null);
   const [traceLabel, setTraceLabel] = useState("capture");
   const [traceNote, setTraceNote] = useState("");
@@ -528,10 +562,11 @@ export function App(): React.JSX.Element {
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [historyDetail, setHistoryDetail] = useState<HistoryDetail | null>(null);
   const [waitForReplayResponse, setWaitForReplayResponse] = useState(false);
-  const [selectedRequestId, setSelectedRequestId] = useState<number | null>(null);
+  const [selectedRequestId, setSelectedRequestId] = useState<PendingRequest["id"] | null>(null);
   const [answerDraft, setAnswerDraft] = useState<Record<string, { option: string; freeform: string }>>({});
   const [agentDescriptors, setAgentDescriptors] = useState<AgentDescriptor[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<AgentId>("codex");
+  const [pendingThreadDraft, setPendingThreadDraft] = useState<PendingThreadDraft | null>(null);
 
   /* UI state */
   const [activeTab, setActiveTab] = useState<"chat" | "debug">(initialUiState.tab);
@@ -561,6 +596,9 @@ export function App(): React.JSX.Element {
   const lastAppliedModeSignatureRef = useRef("");
   const hasHydratedAgentSelectionRef = useRef(false);
   const pendingMaterializationThreadIdsRef = useRef<Set<string>>(new Set());
+  const pendingThreadDraftRef = useRef<PendingThreadDraft | null>(null);
+  const coreDataRefreshInFlightRef = useRef<Promise<void> | null>(null);
+  const coreDataRefreshQueuedRef = useRef(false);
   const threadsSignatureRef = useRef<string[]>([]);
   const modesSignatureRef = useRef<string[]>([]);
   const modelsSignatureRef = useRef<string[]>([]);
@@ -693,6 +731,10 @@ export function App(): React.JSX.Element {
   const canListModels = Boolean(activeAgentCapabilities?.canListModels);
   const canListCollaborationModes = Boolean(activeAgentCapabilities?.canListCollaborationModes);
   const canSubmitUserInputForActiveAgent = Boolean(activeAgentCapabilities?.canSubmitUserInput);
+  const isSelectedThreadBusy = useMemo(
+    () => (selectedThreadId ? busyThreadIds.has(selectedThreadId) : false),
+    [busyThreadIds, selectedThreadId]
+  );
 
   const planModeOption = useMemo(
     () => modes.find((mode) => isPlanModeOption(mode)) ?? null,
@@ -799,24 +841,51 @@ export function App(): React.JSX.Element {
       health?.state.ipcInitialized === false
     )
     : !openCodeConnected;
+
+  const markThreadBusy = useCallback((threadId: string) => {
+    setBusyThreadIds((prev) => {
+      if (prev.has(threadId)) {
+        return prev;
+      }
+      const next = new Set(prev);
+      next.add(threadId);
+      return next;
+    });
+  }, []);
+
+  const clearThreadBusy = useCallback((threadId: string) => {
+    setBusyThreadIds((prev) => {
+      if (!prev.has(threadId)) {
+        return prev;
+      }
+      const next = new Set(prev);
+      next.delete(threadId);
+      return next;
+    });
+  }, []);
   /* Data loading */
-  const loadCoreData = useCallback(async () => {
+  const loadCoreDataOnce = useCallback(async () => {
     const [nh, nt, nm, nmo, nag] = await Promise.all([
       getHealth(),
-      listThreads({ limit: 80, archived: false, all: true, maxPages: 20 }),
+      listThreads({ limit: 80, archived: false, all: false, maxPages: 1 }),
       listCollaborationModes(),
       listModels(),
       listAgents().catch(() => null)
     ]);
     let nextTraceStatus: TraceStatus | null = null;
-    let nextHistory: HistoryResponse["history"] = [];
+    let nextHistory: HistoryResponse["history"] | null = null;
     try {
-      const [ntr, nhist] = await Promise.all([getTraceStatus(), listDebugHistory(120)]);
-      nextTraceStatus = ntr;
-      nextHistory = nhist.history;
+      nextTraceStatus = await getTraceStatus();
+      if (activeTabRef.current === "debug") {
+        const nhist = await listDebugHistory(120);
+        nextHistory = nhist.history;
+      }
     } catch (error) {
       if (!(error instanceof ApiRequestError) || error.statusCode !== 404) {
         throw error;
+      }
+      if (activeTabRef.current === "debug") {
+        nextHistory = [];
       }
     }
     let preferredAgentId: AgentId | null = null;
@@ -825,6 +894,8 @@ export function App(): React.JSX.Element {
         thread.id,
         String(thread.updatedAt ?? 0),
         thread.preview,
+        thread.title ?? "",
+        thread.threadName ?? "",
         thread.agentId,
         thread.cwd ?? "",
         thread.path ?? ""
@@ -857,6 +928,28 @@ export function App(): React.JSX.Element {
         threadsSignatureRef.current = nextThreadsSignature;
         setThreads(nt.data);
       }
+      setSyncedThreadTitleById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+
+        for (const thread of nt.data) {
+          const listedTitle = threadTitleFromListItem(thread);
+          if (listedTitle) {
+            if (next[thread.id] !== listedTitle) {
+              next[thread.id] = listedTitle;
+              changed = true;
+            }
+            continue;
+          }
+
+          if ((thread.title !== undefined || thread.threadName !== undefined) && next[thread.id]) {
+            delete next[thread.id];
+            changed = true;
+          }
+        }
+
+        return changed ? next : prev;
+      });
       if (!signaturesMatch(modesSignatureRef.current, nextModesSignature)) {
         modesSignatureRef.current = nextModesSignature;
         setModes(nm.data);
@@ -881,15 +974,17 @@ export function App(): React.JSX.Element {
         }
         return nextTraceStatus;
       });
-      setHistory((prev) => {
-        if (
-          prev.length === nextHistory.length &&
-          prev[prev.length - 1]?.id === nextHistory[nextHistory.length - 1]?.id
-        ) {
-          return prev;
-        }
-        return nextHistory;
-      });
+      if (nextHistory) {
+        setHistory((prev) => {
+          if (
+            prev.length === nextHistory.length &&
+            prev[prev.length - 1]?.id === nextHistory[nextHistory.length - 1]?.id
+          ) {
+            return prev;
+          }
+          return nextHistory;
+        });
+      }
       if (nag) {
         setAgentDescriptors((prev) => {
           if (
@@ -925,6 +1020,7 @@ export function App(): React.JSX.Element {
       }
       setSelectedThreadId((cur) => {
         if (cur) return cur;
+        if (pendingThreadDraftRef.current) return null;
         if (preferredAgentId) {
           const preferredThread = nt.data.find((thread) => thread.agentId === preferredAgentId);
           if (preferredThread) {
@@ -940,6 +1036,30 @@ export function App(): React.JSX.Element {
       });
     });
   }, []);
+
+  const loadCoreData = useCallback(async () => {
+    if (coreDataRefreshInFlightRef.current) {
+      coreDataRefreshQueuedRef.current = true;
+      await coreDataRefreshInFlightRef.current;
+      return;
+    }
+
+    const runner = (async () => {
+      do {
+        coreDataRefreshQueuedRef.current = false;
+        await loadCoreDataOnce();
+      } while (coreDataRefreshQueuedRef.current);
+    })();
+
+    coreDataRefreshInFlightRef.current = runner;
+    try {
+      await runner;
+    } finally {
+      if (coreDataRefreshInFlightRef.current === runner) {
+        coreDataRefreshInFlightRef.current = null;
+      }
+    }
+  }, [loadCoreDataOnce]);
 
   const loadSelectedThread = useCallback(async (threadId: string) => {
     const includeTurns = !pendingMaterializationThreadIdsRef.current.has(threadId);
@@ -972,6 +1092,19 @@ export function App(): React.JSX.Element {
     if ((live.conversationState?.turns.length ?? 0) > 0 || read.thread.turns.length > 0) {
       pendingMaterializationThreadIdsRef.current.delete(threadId);
     }
+    const syncedConversationTitle = (() => {
+      const liveConversationState = live.conversationState;
+      const readConversationState = read.thread;
+      if (!liveConversationState) {
+        return normalizeThreadTitle(readConversationState.title);
+      }
+      const liveUpdatedAt = getConversationStateUpdatedAt(liveConversationState);
+      const readUpdatedAt = getConversationStateUpdatedAt(readConversationState);
+      if (liveUpdatedAt > readUpdatedAt) {
+        return normalizeThreadTitle(liveConversationState.title);
+      }
+      return normalizeThreadTitle(readConversationState.title);
+    })();
     startTransition(() => {
       setLiveState((prev) => {
         if (buildLiveStateSyncSignature(prev) === buildLiveStateSyncSignature(live)) {
@@ -995,6 +1128,26 @@ export function App(): React.JSX.Element {
         }
         return stream.events;
       });
+      setSyncedThreadTitleById((prev) => {
+        const previousTitle = prev[threadId];
+        if (syncedConversationTitle) {
+          if (previousTitle === syncedConversationTitle) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [threadId]: syncedConversationTitle
+          };
+        }
+
+        if (!previousTitle) {
+          return prev;
+        }
+
+        const next = { ...prev };
+        delete next[threadId];
+        return next;
+      });
     });
   }, [agentsById, selectedAgentId, threads]);
 
@@ -1010,6 +1163,16 @@ export function App(): React.JSX.Element {
 
   useEffect(() => {
     selectedThreadIdRef.current = selectedThreadId;
+  }, [selectedThreadId]);
+
+  useEffect(() => {
+    pendingThreadDraftRef.current = pendingThreadDraft;
+  }, [pendingThreadDraft]);
+
+  useEffect(() => {
+    if (selectedThreadId) {
+      setPendingThreadDraft(null);
+    }
   }, [selectedThreadId]);
 
   useEffect(() => {
@@ -1376,7 +1539,7 @@ export function App(): React.JSX.Element {
   const submitMessage = useCallback(async (draft: string) => {
     if (!draft.trim()) return;
 
-    setIsBusy(true);
+    let busyThreadId: string | null = null;
     try {
       setError("");
 
@@ -1384,24 +1547,32 @@ export function App(): React.JSX.Element {
 
       // Auto-create a thread if none is selected.
       if (!threadId) {
+        const draftConfig = pendingThreadDraftRef.current;
+        const draftAgentId = draftConfig?.agentId ?? selectedAgentId;
         const created = await createThread({
-          agentId: selectedAgentId
+          agentId: draftAgentId,
+          ...(draftConfig ? { cwd: draftConfig.projectPath } : {})
         });
         threadId = created.threadId;
         pendingMaterializationThreadIdsRef.current.add(threadId);
+        setPendingThreadDraft(null);
         setSelectedThreadId(threadId);
         selectedThreadIdRef.current = threadId;
       }
 
+      busyThreadId = threadId;
+      markThreadBusy(threadId);
       await sendMessage({ threadId, text: draft });
       pendingMaterializationThreadIdsRef.current.delete(threadId);
       await refreshAll();
     } catch (e) {
       setError(toErrorMessage(e));
     } finally {
-      setIsBusy(false);
+      if (busyThreadId) {
+        clearThreadBusy(busyThreadId);
+      }
     }
-  }, [refreshAll, selectedAgentId, selectedThreadId]);
+  }, [clearThreadBusy, markThreadBusy, refreshAll, selectedAgentId, selectedThreadId]);
 
   const applyModeDraft = useCallback(async (draft: {
     modeKey: string;
@@ -1455,7 +1626,7 @@ export function App(): React.JSX.Element {
       const text = cur.option || cur.freeform.trim();
       if (text) answers[q.id] = { answers: [text] };
     }
-    setIsBusy(true);
+    markThreadBusy(selectedThreadId);
     try {
       setError("");
       await submitUserInput({
@@ -1467,13 +1638,13 @@ export function App(): React.JSX.Element {
     } catch (e) {
       setError(toErrorMessage(e));
     } finally {
-      setIsBusy(false);
+      clearThreadBusy(selectedThreadId);
     }
-  }, [activeRequest, answerDraft, refreshAll, selectedThreadId]);
+  }, [activeRequest, answerDraft, clearThreadBusy, markThreadBusy, refreshAll, selectedThreadId]);
 
   const skipPendingRequest = useCallback(async () => {
     if (!selectedThreadId || !activeRequest) return;
-    setIsBusy(true);
+    markThreadBusy(selectedThreadId);
     try {
       setError("");
       await submitUserInput({
@@ -1485,13 +1656,13 @@ export function App(): React.JSX.Element {
     } catch (e) {
       setError(toErrorMessage(e));
     } finally {
-      setIsBusy(false);
+      clearThreadBusy(selectedThreadId);
     }
-  }, [activeRequest, refreshAll, selectedThreadId]);
+  }, [activeRequest, clearThreadBusy, markThreadBusy, refreshAll, selectedThreadId]);
 
   const runInterrupt = useCallback(async () => {
     if (!selectedThreadId) return;
-    setIsBusy(true);
+    markThreadBusy(selectedThreadId);
     try {
       setError("");
       await interruptThread({ threadId: selectedThreadId });
@@ -1499,9 +1670,9 @@ export function App(): React.JSX.Element {
     } catch (e) {
       setError(toErrorMessage(e));
     } finally {
-      setIsBusy(false);
+      clearThreadBusy(selectedThreadId);
     }
-  }, [refreshAll, selectedThreadId]);
+  }, [clearThreadBusy, markThreadBusy, refreshAll, selectedThreadId]);
 
   const loadHistoryDetail = useCallback(async (id: string) => {
     if (!id) { setHistoryDetail(null); return; }
@@ -1523,30 +1694,28 @@ export function App(): React.JSX.Element {
     []
   );
 
-  const createNewThread = useCallback(async (projectPath: string, agentId?: AgentId) => {
+  const createNewThread = useCallback((projectPath: string, agentId?: AgentId) => {
     const trimmedProjectPath = projectPath.trim();
     if (!trimmedProjectPath) {
       setError("Cannot create thread: missing project path");
       return;
     }
-    setIsBusy(true);
-    try {
-      setError("");
-      const created = await createThread({
-        cwd: trimmedProjectPath,
-        ...(agentId ? { agentId } : {})
-      });
-      pendingMaterializationThreadIdsRef.current.add(created.threadId);
-      setSelectedThreadId(created.threadId);
-      selectedThreadIdRef.current = created.threadId;
-      setMobileSidebarOpen(false);
-      await refreshAll();
-    } catch (e) {
-      setError(toErrorMessage(e));
-    } finally {
-      setIsBusy(false);
-    }
-  }, [refreshAll]);
+    const nextAgentId = agentId ?? selectedAgentId;
+    setError("");
+    setSelectedAgentId(nextAgentId);
+    setPendingThreadDraft({
+      projectPath: trimmedProjectPath,
+      agentId: nextAgentId
+    });
+    setSelectedThreadId(null);
+    selectedThreadIdRef.current = null;
+    setMobileSidebarOpen(false);
+    startTransition(() => {
+      setReadThreadState(null);
+      setLiveState(null);
+      setStreamEvents([]);
+    });
+  }, [selectedAgentId]);
 
   const createThreadForSingleAgent = useCallback((projectPath: string) => {
     const onlyAgentId = availableAgentIds[0];
@@ -1554,7 +1723,7 @@ export function App(): React.JSX.Element {
       setError("Cannot create thread: no enabled agent");
       return;
     }
-    void createNewThread(projectPath, onlyAgentId);
+    createNewThread(projectPath, onlyAgentId);
   }, [availableAgentIds, createNewThread]);
 
   const renderSidebarContent = (viewport: "desktop" | "mobile"): React.JSX.Element => (
@@ -1599,7 +1768,6 @@ export function App(): React.JSX.Element {
                     variant="outline"
                     size="sm"
                     className="rounded-full"
-                    disabled={isBusy}
                     onClick={() => {
                       const defaultProjectPath = selectedAgentDescriptor?.projectDirectories[0] ?? ".";
                       createThreadForSingleAgent(defaultProjectPath);
@@ -1616,7 +1784,6 @@ export function App(): React.JSX.Element {
                         variant="outline"
                         size="sm"
                         className="rounded-full"
-                        disabled={isBusy}
                       >
                         <Plus size={13} className="mr-1.5" />
                         New thread
@@ -1687,7 +1854,7 @@ export function App(): React.JSX.Element {
                             ? `New ${nextAgentLabel} thread in ${group.label}`
                             : "Cannot create thread: missing project path"
                         }
-                        disabled={isBusy || !group.projectPath}
+                        disabled={!group.projectPath}
                       >
                         <Plus size={14} />
                       </IconBtn>
@@ -1696,7 +1863,7 @@ export function App(): React.JSX.Element {
                         <DropdownMenuTrigger asChild>
                           <Button
                             type="button"
-                            disabled={isBusy || !group.projectPath}
+                            disabled={!group.projectPath}
                             variant="ghost"
                             size="icon"
                             className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -1769,7 +1936,7 @@ export function App(): React.JSX.Element {
                                   />
                                 </span>
                               )}
-                                <span className="truncate">{threadLabel(thread)}</span>
+                                <span className="truncate">{threadLabelWithSyncedTitle(thread, syncedThreadTitleById)}</span>
                               </span>
                             <span className="shrink-0 flex items-center gap-1.5">
                               {threadIsGenerating && (
@@ -1936,7 +2103,9 @@ export function App(): React.JSX.Element {
             )}
             <div className="min-w-0">
               <div className="text-sm font-medium truncate leading-5 flex items-center gap-1.5">
-                {selectedThread ? threadLabel(selectedThread) : "No thread selected"}
+                {selectedThread
+                  ? threadLabelWithSyncedTitle(selectedThread, syncedThreadTitleById)
+                  : "No thread selected"}
                 {selectedThread && activeAgentLabel && (
                   <span className="shrink-0 h-5 w-5 rounded-md bg-muted/30 ring-1 ring-border/60 flex items-center justify-center overflow-hidden">
                     <AgentFavicon
@@ -1959,10 +2128,9 @@ export function App(): React.JSX.Element {
           <div className="flex items-center gap-0.5 shrink-0">
             <IconBtn
               onClick={() => void refreshAll()}
-              disabled={isBusy}
               title="Refresh"
             >
-              <RefreshCcw size={14} className={isBusy ? "animate-spin" : ""} />
+              <RefreshCcw size={14} />
             </IconBtn>
             <IconBtn
               onClick={() => setActiveTab(activeTab === "debug" ? "chat" : "debug")}
@@ -2131,7 +2299,7 @@ export function App(): React.JSX.Element {
                       onDraftChange={handleAnswerChange}
                       onSubmit={() => void submitPendingRequest()}
                       onSkip={() => void skipPendingRequest()}
-                      isBusy={isBusy}
+                      isBusy={isSelectedThreadBusy}
                     />
                   )}
                 </AnimatePresence>
@@ -2155,7 +2323,7 @@ export function App(): React.JSX.Element {
                 <div className="flex flex-col gap-2">
                   <ChatComposer
                     canSend={Boolean(selectedThreadId) || availableAgentIds.length > 0}
-                    isBusy={isBusy}
+                    isBusy={isSelectedThreadBusy}
                     isGenerating={isGenerating}
                     placeholder={
                       selectedThreadId
